@@ -1,0 +1,18 @@
+# docker-compose.yml
+version: '3.8'
+
+services:
+  db:
+    image: postgres:15
+    container_name: coal_db
+    environment:
+      POSTGRES_DB: coal_hack
+      POSTGRES_USER: hack_user
+      POSTGRES_PASSWORD: hack_pass
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+volumes:
+  pgdata:

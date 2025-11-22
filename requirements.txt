@@ -1,0 +1,12 @@
+fastapi>=0.100.0
+uvicorn[standard]>=0.22.0
+pandas>=2.0.0
+numpy>=1.24.0
+sqlalchemy>=2.0.0
+psycopg2-binary>=2.9.0      # PostgreSQL адаптер для Python
+python-multipart>=0.0.6
+alembic>=1.13.0             # (опционально) для миграций
+sqlmodel>=0.0.8
+asyncpg>=0.27.0
+sqlalchemy[asyncio]>=2.0.0
+sqlmodel>=0.0.8
