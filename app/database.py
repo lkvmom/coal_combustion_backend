@@ -1,10 +1,20 @@
+# app/database.py
 from sqlmodel import create_engine
+from sqlalchemy.orm import sessionmaker
 import os
 
-DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://postgres:123456@localhost:5432/coal_hack")
+# Строка подключения (используй свои значения)
+DATABASE_URL = os.getenv(
+    "DATABASE_URL",
+    "postgresql://postgres:123456@localhost:5432/coal_hack"
+)
+
+# Синхронный движок (для загрузки данных и инициализации)
 engine = create_engine(DATABASE_URL, echo=False)
 
-def create_db_and_tables():
-    from app.models.db_models import CurrentStockpile, ActualFire
-    CurrentStockpile.metadata.create_all(engine)
-    ActualFire.metadata.create_all(engine)
+# Сессия для использования в сервисах
+SessionLocal = sessionmaker(bind=engine, expire_on_commit=False)
+
+def get_session():
+    with SessionLocal() as session:
+        yield session
