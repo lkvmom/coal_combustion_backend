@@ -1,7 +1,7 @@
 from fastapi import APIRouter, File, UploadFile, HTTPException, Query, Depends
 from sqlalchemy.orm import Session
 from sqlalchemy import func
-from datetime import datetime, date
+from datetime import datetime, timedelta
 import pandas as pd
 from io import BytesIO
 
@@ -11,16 +11,69 @@ from app.models.db_models import (
     ActualFire,
     Temperature,
     FireEvent,
-    Weather
+    Weather,
+    Supply
 )
 from app.services.predictor import predict_ignition_risk
 
-router = APIRouter(prefix="/api", tags=["core"])
+from pydantic import BaseModel
 
+class PredictionRequest(BaseModel):
+    Склад: int
+    Штабель: int
+    Марка: str
+    Максимальная_температура: float
+    Смена: int
+    t: float
+    p: float
+    humidity: int
+    precipitation: float
+    wind_dir: int
+    v_avg: float
+    v_max: float
+    cloudcover: int
+    weather_code: int
+    Наим_ЕТСНГ: str
+    На_склад_тн: float
+    На_судно_тн: float
+    Склад_supply: int
+    ДниСНачалаФормирования: int
+
+router = APIRouter(prefix="/api", tags=["core"])
 
 def get_session():
     with Session(engine) as session:
         yield session
+
+@router.post("/predict")
+def predict(request: PredictionRequest, session: Session = Depends(get_session)):
+    # Преобразуйте поля в нужный формат для модели
+    features = {
+        "warehouse": request.Склад,
+        "pile_id": str(request.Штабель),
+        "coal_grade": request.Марка,
+        "current_temp": request.Максимальная_температура,
+        "shift": request.Смена,
+        "t": request.t,
+        "p": request.p,
+        "humidity": request.humidity,
+        "precipitation": request.precipitation,
+        "wind_dir": request.wind_dir,
+        "v_avg": request.v_avg,
+        "v_max": request.v_max,
+        "cloudcover": request.cloudcover,
+        "weather_code": request.weather_code,
+        "coal_grade_supply": request.Наим_ЕТСНГ,
+        "to_warehouse_tn": request.На_склад_тн,
+        "to_ship_tn": request.На_судно_тн,
+        "supply_warehouse": request.Склад_supply,
+        "pile_age_days": request.ДниСНачалаФормирования
+    }
+
+    # Передайте в вашу модель
+    return predict_ignition_risk(features, session)
+
+# ... остальные эндпоинты ...
 
 
 # 1. Приём данных о текущем штабеле (на ноябрь 2025)
@@ -44,25 +97,6 @@ def submit_stockpile(
     session.commit()
     session.refresh(stockpile)
     return {"id": stockpile.id, "status": "ok"}
-
-
-# 2. Прогноз самовозгорания
-@router.post("/predict")
-def predict(
-    warehouse: int,
-    pile_id: str,
-    current_temp: float,
-    pile_age_days: int,
-    coal_grade: str,
-    current_date: str = "2025-11-21"
-):
-    features = {
-        "current_temp": current_temp,
-        "pile_age_days": pile_age_days,
-        "coal_grade": coal_grade,
-        "current_date": current_date
-    }
-    return predict_ignition_risk(features)
 
 
 # 3. Календарь на 21–25 ноября 2025
@@ -211,6 +245,31 @@ async def upload_csv(
             ))
             inserted += 1
 
+    elif "supply" in filename or "supplies" in filename:
+        df.columns = ["ВыгрузкаНаСклад", "Наим. ЕТСНГ", "Штабель", "ПогрузкаНаСудно", "На склад, тн", "На судно, тн", "Склад"]
+
+        df["ВыгрузкаНаСклад"] = pd.to_datetime(df["ВыгрузкаНаСклад"], errors="coerce")
+        df["ПогрузкаНаСудно"] = pd.to_datetime(df["ПогрузкаНаСудно"], errors="coerce")
+        df["Штабель"] = pd.to_numeric(df["Штабель"], errors="coerce").astype("Int64")
+        df["Склад"] = pd.to_numeric(df["Склад"], errors="coerce").astype("Int64")
+        df["На склад, тн"] = pd.to_numeric(df["На склад, тн"], errors="coerce")
+        df["На судно, тн"] = pd.to_numeric(df["На судно, тн"], errors="coerce")
+
+        df = df.dropna(subset=["ВыгрузкаНаСклад", "Штабель", "Склад"])
+
+        for _, row in df.iterrows():
+            s = Supply(
+                unload_to_warehouse=row["ВыгрузкаНаСклад"],
+                coal_grade=row["Наим. ЕТСНГ"],
+                pile_id=row["Штабель"],
+                load_to_ship=row["ПогрузкаНаСудно"],
+                to_warehouse_tn=row["На склад, тн"],
+                to_ship_tn=row["На судно, тн"],
+                warehouse=row["Склад"]
+            )
+            session.add(s)
+            inserted += 1
+
     else:
         raise HTTPException(400, "Неподдерживаемый файл. Ожидается: temperature.csv, fires.csv или weather_data_*.csv")
 
@@ -258,7 +317,7 @@ def get_weather(
 @router.get("/pile-weather")
 def get_pile_weather(
     warehouse: int,
-    pile_id: str,
+    pileId: str,       # ← именно так, как в фронтенде
     start: str,
     end: str,
     session: Session = Depends(get_session)
@@ -267,30 +326,32 @@ def get_pile_weather(
         start_dt = datetime.fromisoformat(start)
         end_dt = datetime.fromisoformat(end)
     except ValueError:
-        raise HTTPException(400, "Неверный формат даты: YYYY-MM-DD")
+        raise HTTPException(status_code=400, detail="Неверный формат даты: YYYY-MM-DD")
 
     temps = session.query(Temperature).filter(
         Temperature.warehouse == warehouse,
-        Temperature.pile_id == pile_id,
+        Temperature.pile_id == pileId,  # ← именно так
         Temperature.measurement_date >= start_dt,
         Temperature.measurement_date <= end_dt
-    ).all()
+    ).order_by(Temperature.measurement_date).all()  # ← добавь сортировку
 
     fires = session.query(FireEvent).filter(
         FireEvent.warehouse == warehouse,
-        FireEvent.pile_id == pile_id,
+        FireEvent.pile_id == pileId,  # ← и здесь
         FireEvent.fire_start >= start_dt,
         FireEvent.fire_start <= end_dt
-    ).all()
+    ).order_by(FireEvent.fire_start).all()  # ← и здесь
 
     weather = session.query(
         func.date(Weather.datetime).label("date"),
         func.avg(Weather.temp).label("avg_temp"),
-        func.avg(Weather.humidity).label("avg_humidity")
+        func.avg(Weather.humidity).label("avg_humidity"),
+        func.sum(Weather.precipitation).label("total_precip"),
+        func.avg(Weather.wind_speed).label("avg_wind_speed")
     ).filter(
         Weather.datetime >= start_dt,
         Weather.datetime <= end_dt
-    ).group_by(func.date(Weather.datetime)).all()
+    ).group_by(func.date(Weather.datetime)).order_by(func.date(Weather.datetime)).all()  # ← и здесь
 
     return {
         "temperatures": [
@@ -305,7 +366,9 @@ def get_pile_weather(
             {
                 "date": str(w.date),
                 "avg_temp": float(w.avg_temp),
-                "avg_humidity": int(w.avg_humidity)
+                "avg_humidity": int(w.avg_humidity),
+                "total_precip": float(w.total_precip),
+                "avg_wind_speed": float(w.avg_wind_speed)
             }
             for w in weather
         ],
@@ -315,4 +378,336 @@ def get_pile_weather(
             }
             for f in fires
         ]
+    }
+
+@router.get("/warehouses")
+def get_warehouses(session: Session = Depends(get_session)):
+    result = session.query(Temperature.warehouse).distinct().all()
+    return {"warehouses": [r[0] for r in result]}
+
+@router.get("/stacks/{warehouse}")
+def get_stacks(warehouse: int, session: Session = Depends(get_session)):
+    result = session.query(Temperature.pile_id).filter(Temperature.warehouse == warehouse).distinct().all()
+    return {"stacks": [r[0] for r in result]}   
+
+
+@router.get("/pile-age")
+def get_pile_age(warehouse: int, pileId: str, session: Session = Depends(get_session)):
+    from datetime import datetime
+    # Получаем дату формирования штабеля из fires
+    fire_record = session.query(FireEvent).filter(
+        FireEvent.warehouse == warehouse,
+        FireEvent.pile_id == pileId
+    ).first()
+
+    if fire_record and fire_record.pile_formed_at:
+        pile_age = (datetime.now() - fire_record.pile_formed_at).days
+        return {"pile_age_days": pile_age}
+    else:
+        return {"pile_age_days": 30}  # заглушка
+    
+
+@router.get("/dashboard-summary")
+def get_dashboard_summary(
+    forecast_days: int = Query(5, description="Количество дней для прогноза"),
+    session: Session = Depends(get_session)
+):
+    # ❗️Найти последнюю дату в БД (температура или погода)
+    last_temp_date_result = session.query(
+        func.max(Temperature.measurement_date)
+    ).scalar()
+
+    last_weather_date_result = session.query(
+        func.max(Weather.datetime)
+    ).scalar()
+
+    # Выбираем более позднюю дату
+    last_date = None
+    if last_temp_date_result and last_weather_date_result:
+        last_date = max(last_temp_date_result.date(), last_weather_date_result.date())
+    elif last_temp_date_result:
+        last_date = last_temp_date_result.date()
+    elif last_weather_date_result:
+        last_date = last_weather_date_result.date()
+    else:
+        raise HTTPException(status_code=404, detail="Нет данных температуры или погоды в БД")
+
+    # ❗️Дата начала прогноза — следующий день после последней даты
+    start_date = last_date + timedelta(days=1)
+    end_date = start_date + timedelta(days=forecast_days - 1)
+
+    # ❗️Получить все уникальные штабели
+    unique_piles = session.query(Temperature.warehouse, Temperature.pile_id).distinct().all()
+
+    incidents = []
+
+    for wp in unique_piles:
+        warehouse = wp[0]
+        pile_id = wp[1]
+
+        # ❗️Получить последнюю температуру
+        last_temp = session.query(Temperature).filter(
+            Temperature.warehouse == warehouse,
+            Temperature.pile_id == pile_id
+        ).order_by(Temperature.measurement_date.desc()).first()
+
+        if not last_temp:
+            continue
+
+        # ❗️Получить дату формирования штабеля
+        fire_record = session.query(FireEvent).filter(
+            FireEvent.warehouse == warehouse,
+            FireEvent.pile_id == pile_id
+        ).first()
+
+        if fire_record and fire_record.pile_formed_at:
+            pile_age_days = (last_date - fire_record.pile_formed_at.date()).days
+        else:
+            pile_age_days = 30  # дефолт
+
+        # ❗️Получить погоду за последний день температуры
+        weather_record = session.query(Weather).filter(
+            func.date(Weather.datetime) == last_temp.measurement_date.date()
+        ).first()
+
+        if weather_record:
+            t = weather_record.temp
+            p = weather_record.pressure
+            humidity = weather_record.humidity
+            precipitation = weather_record.precipitation
+            wind_dir = weather_record.wind_dir
+            v_avg = weather_record.wind_speed
+            v_max = v_avg * 1.5
+            cloudcover = weather_record.cloudcover
+            weather_code = weather_record.weather_code
+        else:
+            # дефолт
+            t = 20.0
+            p = 1013.25
+            humidity = 65
+            precipitation = 0.0
+            wind_dir = 0
+            v_avg = 5.0
+            v_max = 7.5
+            cloudcover = 50
+            weather_code = 0
+
+        # ❗️Подготовить признаки
+        predict_data = {
+            "Склад": warehouse,
+            "Штабель": int(pile_id),
+            "Марка": last_temp.coal_grade,
+            "Максимальная_температура": last_temp.max_temp,
+            "Смена": last_temp.shift,
+            "t": t,
+            "p": p,
+            "humidity": humidity,
+            "precipitation": precipitation,
+            "wind_dir": wind_dir,
+            "v_avg": v_avg,
+            "v_max": v_max,
+            "cloudcover": cloudcover,
+            "weather_code": weather_code,
+            "Наим_ЕТСНГ": last_temp.coal_grade,
+            "На_склад_тн": 0.0,
+            "На_судно_тн": 0.0,
+            "Склад_supply": warehouse,
+            "ДниСНачалаФормирования": pile_age_days
+        }
+
+        # ❗️Вызвать predict (передаём session)
+        try:
+            prediction = predict_ignition_risk(predict_data, session)
+            predicted_date_str = prediction.get("predicted_ignition_date")
+
+            if predicted_date_str:
+                predicted_date = datetime.fromisoformat(predicted_date_str).date()
+
+                if start_date <= predicted_date <= end_date:
+                    incidents.append({
+                        "date": predicted_date.isoformat(),
+                        "warehouse": warehouse,
+                        "pile_id": pile_id,
+                        "predicted_ignition_date": predicted_date_str,
+                        "message": prediction.get("message", "")
+                    })
+        except Exception as e:
+            # Логировать, если нужно
+            continue
+
+    # ❗️Агрегировать по дням
+    from collections import defaultdict
+    summary_by_day = defaultdict(int)
+    for inc in incidents:
+        summary_by_day[inc["date"]] += 1
+
+    # ❗️Заполнить пропущенные дни
+    date_list = [(start_date + timedelta(days=i)).isoformat() for i in range(forecast_days)]
+    final_summary = []
+    for d in date_list:
+        final_summary.append({
+            "date": d,
+            "count": summary_by_day[d]
+        })
+
+    return {
+        "period": f"{start_date.strftime('%Y-%m-%d')} — {end_date.strftime('%Y-%m-%d')}",
+        "summary_by_day": final_summary,
+        "high_risk_incidents": incidents
+    }
+
+
+@router.get("/dashboard-summary-test")
+def get_dashboard_summary_test(
+    start_date: str = Query(..., description="Дата начала прогноза (YYYY-MM-DD)"),
+    end_date: str = Query(..., description="Дата окончания прогноза (YYYY-MM-DD)"),
+    session: Session = Depends(get_session)
+):
+    print(f"DEBUG: start_date = {start_date}, end_date = {end_date}")
+    print("DEBUG: Запрос на /dashboard-summary-test получен")
+
+    try:
+        start_dt = datetime.fromisoformat(start_date).date()
+        end_dt = datetime.fromisoformat(end_date).date()
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Неверный формат даты. Ожидается YYYY-MM-DD")
+
+    if start_dt > end_dt:
+        raise HTTPException(status_code=400, detail="Дата начала не может быть позже даты окончания")
+
+    unique_piles = session.query(Temperature.warehouse, Temperature.pile_id).distinct().all()
+
+    incidents = []
+
+    for idx, wp in enumerate(unique_piles):
+        warehouse = wp[0]
+        pile_id = wp[1]
+
+        print(f"DEBUG [{idx}]: Обрабатываю штабель {warehouse}, {pile_id}")
+
+        # ❗️Получить **последнюю температуру до start_date**
+        last_temp = session.query(Temperature).filter(
+            Temperature.warehouse == warehouse,
+            Temperature.pile_id == pile_id,
+            Temperature.measurement_date < start_dt  # ❗️Не включая start_date
+        ).order_by(Temperature.measurement_date.desc()).first()
+
+        if not last_temp:
+            print(f"❌ Нет температуры для {warehouse}, {pile_id} до {start_dt}")
+            continue
+        else:
+            print(f"✅ Найдена температура: {last_temp.max_temp}°C на дату {last_temp.measurement_date}")
+
+        # ❗️Получить возраст штабеля
+        fire_record = session.query(FireEvent).filter(
+            FireEvent.warehouse == warehouse,
+            FireEvent.pile_id == pile_id
+        ).first()
+
+        if fire_record and fire_record.pile_formed_at:
+            pile_age_days = (start_dt - fire_record.pile_formed_at.date()).days
+        else:
+            pile_age_days = 30  # дефолт
+
+        # ❗️ПОЛУЧАЕМ ПОГОДУ ЗА ДЕНЬ ДО start_date — или БЛИЖАЙШУЮ, ЕСЛИ НЕТ
+        weather_date = start_dt - timedelta(days=1)
+
+        # ❗️Ищем **ближайшую погоду <= weather_date**
+        weather_record = session.query(Weather).filter(
+            func.date(Weather.datetime) <= weather_date
+        ).order_by(Weather.datetime.desc()).first()
+
+        if weather_record:
+            print(f"✅ Найдена погода за {weather_record.datetime.date()}")
+            t = weather_record.temp
+            p = weather_record.pressure
+            humidity = int(weather_record.humidity)
+            precipitation = weather_record.precipitation
+            wind_dir = weather_record.wind_dir or 0
+            v_avg = weather_record.wind_speed
+            v_max = weather_record.v_max or (v_avg * 1.5)
+            cloudcover = weather_record.cloudcover or 50
+            weather_code = weather_record.weather_code or 0
+        else:
+            print(f"❌ Нет погоды до {weather_date}, используем дефолтные значения")
+            # ❗️Не пропускаем штабель — используем дефолтные значения
+            t = 5.0
+            p = 1013.25
+            humidity = 70
+            precipitation = 0.0
+            wind_dir = 0
+            v_avg = 5.0
+            v_max = 7.5
+            cloudcover = 50
+            weather_code = 0
+
+        # ❗️Подготовить признаки
+        predict_data = {
+            "Склад": warehouse,
+            "Штабель": int(pile_id),
+            "Марка": last_temp.coal_grade,
+            "Максимальная_температура": last_temp.max_temp,
+            "Смена": last_temp.shift,
+            "t": t,
+            "p": p,
+            "humidity": humidity,
+            "precipitation": precipitation,
+            "wind_dir": wind_dir,
+            "v_avg": v_avg,
+            "v_max": v_max,
+            "cloudcover": cloudcover,
+            "weather_code": weather_code,
+            "Наим_ЕТСНГ": last_temp.coal_grade,
+            "На_склад_тн": 0.0,
+            "На_судно_тн": 0.0,
+            "Склад_supply": warehouse,
+            "ДниСНачалаФормирования": pile_age_days
+        }
+
+        # ❗️Вызвать predict
+        try:
+            print(f"DEBUG: Вызов predict_ignition_risk для склада {warehouse}, штабель {pile_id}")
+            prediction = predict_ignition_risk(predict_data, session)
+            print(f"DEBUG: Прогноз: {prediction}")
+
+            predicted_date_str = prediction.get("predicted_ignition_date")
+
+            if predicted_date_str:
+                predicted_date = datetime.fromisoformat(predicted_date_str).date()
+
+                if start_dt <= predicted_date <= end_dt:  # ❗️Проверка попадания в диапазон
+                    incidents.append({
+                        "date": predicted_date.isoformat(),
+                        "warehouse": warehouse,
+                        "pile_id": pile_id,
+                        "predicted_ignition_date": predicted_date_str,
+                        "message": prediction.get("message", "")
+                    })
+        except Exception as e:
+            print(f"ERROR: Прогноз не удался для {warehouse}, {pile_id}: {e}")
+            import traceback
+            traceback.print_exc()
+            continue
+
+    # ❗️Агрегировать по дням
+    from collections import defaultdict
+    summary_by_day = defaultdict(int)
+    for inc in incidents:
+        summary_by_day[inc["date"]] += 1
+
+    # ❗️Заполнить все дни в диапазоне
+    date_list = [(start_dt + timedelta(days=i)).isoformat() for i in range((end_dt - start_dt).days + 1)]
+    final_summary = []
+    for d in date_list:
+        final_summary.append({
+            "date": d,
+            "count": summary_by_day[d]
+        })
+
+    print(f"DEBUG: Возвращаем {len(incidents)} инцидентов и {len(final_summary)} дней")
+
+    return {
+        "period": f"{start_date} — {end_date}",
+        "summary_by_day": final_summary,
+        "high_risk_incidents": incidents
     }

@@ -55,3 +55,14 @@ class Weather(SQLModel, table=True):
     cloudcover: Optional[int]             # облачность, %
     visibility: Optional[int]             # видимость, м
     weather_code: Optional[int]           # код погоды
+
+
+class Supply(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    unload_to_warehouse: datetime  # ВыгрузкаНаСклад
+    coal_grade: str                # Наим. ЕТСНГ
+    pile_id: int                   # Штабель
+    load_to_ship: datetime         # ПогрузкаНаСудно
+    to_warehouse_tn: float         # "На склад, тн"
+    to_ship_tn: float              # "На судно, тн"
+    warehouse: int                 # Склад

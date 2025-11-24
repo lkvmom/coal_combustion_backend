@@ -1,18 +1,55 @@
-# docker-compose.yml
 version: '3.8'
 
 services:
-  db:
-    image: postgres:15
-    container_name: coal_db
+  postgres:
+    image: postgres:17
+    container_name: coal_postgres
     environment:
       POSTGRES_DB: coal_hack
-      POSTGRES_USER: hack_user
-      POSTGRES_PASSWORD: hack_pass
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: 123456
     ports:
       - "5432:5432"
     volumes:
-      - pgdata:/var/lib/postgresql/data
+      - ./postgres-data:/var/lib/postgresql/data
+      - ./data:/docker-entrypoint-initdb.d/data  # для начальной загрузки
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
 
-volumes:
-  pgdata:
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile.backend
+    container_name: coal_backend
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    environment:
+      - DATABASE_URL=postgresql://postgres:123456@postgres:5432/coal_hack
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models  # если модель лежит в ./models
+    command: >
+      sh -c "
+        python init_db.py &&
+        uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+      "
+
+  frontend:
+    build:
+      context: .
+      dockerfile: Dockerfile.frontend
+    container_name: coal_frontend
+    depends_on:
+      - backend
+    ports:
+      - "3000:3000"
+    environment:
+      - REACT_APP_API_URL=http://localhost:8000
+    volumes:
+      - ./frontend/src:/app/src
